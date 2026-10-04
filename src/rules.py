@@ -117,11 +117,48 @@ def _validate_result_batch(actor, data, lookup):
         raise ValidationError("assay does not exist")
     if not _find_one(lookup, "instrument", "id", data.get("instrument_id")):
         raise ValidationError("instrument does not exist")
-    if not _find_one(lookup, "qc_run", "id", data.get("qc_run_id")):
+    run = _find_one(lookup, "qc_run", "id", data.get("qc_run_id"))
+    if not run:
         raise ValidationError("qc run does not exist")
     if int(data.get("patient_count", 0)) < 0:
         raise ValidationError("patient_count cannot be negative")
-    return {}
+    # Stamp the batch with the QC lot in force at creation time. Legacy rows
+    # without a stamp fall back to their referenced QC run's lot when read.
+    return {"qc_lot_id": run["data"].get("qc_lot_id")}
+
+
+def _validate_takeover(actor, data, lookup):
+    assay = _find_one(lookup, "assay", "id", data.get("assay_id"))
+    if not assay:
+        raise ValidationError("assay does not exist")
+    previous = _find_one(lookup, "qc_lot", "id", data.get("previous_lot_id"))
+    new_lot = _find_one(lookup, "qc_lot", "id", data.get("new_lot_id"))
+    if not previous or previous["status"] != "active":
+        raise ValidationError("previous lot must be the active lot")
+    if not new_lot or new_lot["status"] != "registered":
+        raise ValidationError("new lot must be registered before a takeover run")
+    if previous["data"].get("assay_id") != assay["id"] or new_lot["data"].get("assay_id") != assay["id"]:
+        raise ValidationError("both lots must belong to the takeover assay")
+    if previous["id"] == new_lot["id"]:
+        raise ValidationError("previous and new lots must differ")
+    instrument_ids = data.get("instrument_ids") or []
+    if not isinstance(instrument_ids, list) or not instrument_ids:
+        raise ValidationError("instrument_ids must be a non-empty list")
+    slots = []
+    for instrument_id in instrument_ids:
+        instrument = _find_one(lookup, "instrument", "id", instrument_id)
+        if not instrument:
+            raise ValidationError("instrument does not exist: " + str(instrument_id))
+        if any(slot["instrument_id"] == instrument_id for slot in slots):
+            raise ConflictError("instrument listed twice in takeover: " + str(instrument_id))
+        slots.append({"instrument_id": instrument_id, "status": "pending", "qc_run_id": None})
+    for open_takeover in lookup("takeover", "assay_id", assay["id"]) or []:
+        if open_takeover["status"] in ("trialing", "ready"):
+            raise ConflictError(
+                "an open takeover already exists for this assay",
+                details={"takeover_id": open_takeover["id"], "status": open_takeover["status"]},
+            )
+    return {"slots": slots}
 
 
 def _validate_evaluate(actor, entity, data, lookup):
@@ -201,6 +238,7 @@ class RuleEngine:
         "instruments": "instrument",
         "qc_runs": "qc_run",
         "result_batches": "result_batch",
+        "takeovers": "takeover",
     }
     INITIAL_STATUS = {
         "assay": "active",
@@ -208,6 +246,7 @@ class RuleEngine:
         "instrument": "ready",
         "qc_run": "pending",
         "result_batch": "waiting",
+        "takeover": "trialing",
     }
     TRANSITIONS = {
         "assay": {
@@ -241,6 +280,9 @@ class RuleEngine:
             "resolve": (("investigating",), "resolved"),
             "correct": (("waiting", "intercepted", "investigating", "released", "resolved"), "waiting"),
         },
+        "takeover": {
+            "record_trial": (("trialing", "ready"), "ready"),
+        },
     }
     CREATE_REQUIRED = {
         "assay": ("name", "unit", "allowed_low", "allowed_high"),
@@ -248,6 +290,7 @@ class RuleEngine:
         "instrument": ("name", "serial", "calibration_due"),
         "qc_run": ("assay_id", "qc_lot_id", "instrument_id", "value", "run_at"),
         "result_batch": ("assay_id", "instrument_id", "qc_run_id", "run_at", "patient_count"),
+        "takeover": ("assay_id", "previous_lot_id", "new_lot_id", "instrument_ids"),
     }
     ACTION_REQUIRED = {
         ("assay", "suspend"): ("reason",),
@@ -268,6 +311,7 @@ class RuleEngine:
         ("result_batch", "investigate"): ("reason",),
         ("result_batch", "resolve"): ("resolution",),
         ("result_batch", "correct"): ("reason",),
+        ("takeover", "record_trial"): ("instrument_id", "qc_run_id"),
     }
     CREATE_ROLES = {
         "assay": ("supervisor", "admin"),
@@ -275,6 +319,7 @@ class RuleEngine:
         "instrument": ("supervisor", "admin"),
         "qc_run": ("operator", "supervisor", "admin"),
         "result_batch": ("operator", "supervisor", "admin"),
+        "takeover": ("supervisor", "admin"),
     }
     ROLE_ACTIONS = {
         "suspend": ("supervisor", "admin"),
@@ -292,6 +337,8 @@ class RuleEngine:
         "correct": ("supervisor", "admin"),
         "release": ("supervisor", "admin"),
         "intercept": ("operator", "supervisor", "admin"),
+        "record_trial": ("operator", "supervisor", "admin"),
+        ("takeover", "confirm"): ("supervisor", "admin"),
     }
     CUSTOM_CREATE = {
         "assay": _validate_assay,
@@ -299,6 +346,7 @@ class RuleEngine:
         "instrument": _validate_instrument,
         "qc_run": _validate_qc_run,
         "result_batch": _validate_result_batch,
+        "takeover": _validate_takeover,
     }
     CUSTOM_TRANSITIONS = {
         ("qc_run", "evaluate"): _validate_evaluate,
@@ -323,8 +371,12 @@ class RuleEngine:
         if actor.role not in allowed:
             raise PermissionDenied("role %s is not allowed here" % actor.role)
 
+    def ensure_action_role(self, kind, action, actor):
+        allowed_roles = self.ROLE_ACTIONS.get((kind, action), self.ROLE_ACTIONS.get(action, ("admin",)))
+        self._ensure_role(actor, allowed_roles)
+
     @staticmethod
-    def _require(data, fields):
+    def require_fields(data, fields):
         for field in fields:
             value = data.get(field)
             if value is None or value == "" or value == [] or value == {}:
@@ -335,7 +387,7 @@ class RuleEngine:
         if kind not in self.INITIAL_STATUS:
             raise ValidationError("unknown kind: " + str(kind))
         self._ensure_role(actor, self.CREATE_ROLES.get(kind, ("admin",)))
-        self._require(data, self.CREATE_REQUIRED.get(kind, ()))
+        self.require_fields(data, self.CREATE_REQUIRED.get(kind, ()))
         custom = self.CUSTOM_CREATE.get(kind)
         return custom(actor, data, lookup) if custom else {}
 
@@ -349,7 +401,7 @@ class RuleEngine:
             raise InvalidTransition("cannot %s from status %s" % (action, entity["status"]))
         allowed_roles = self.ROLE_ACTIONS.get((kind, action), self.ROLE_ACTIONS.get(action, ("admin",)))
         self._ensure_role(actor, allowed_roles)
-        self._require(data, self.ACTION_REQUIRED.get((kind, action), ()))
+        self.require_fields(data, self.ACTION_REQUIRED.get((kind, action), ()))
         custom = self.CUSTOM_TRANSITIONS.get((kind, action))
         extra = custom(actor, entity, data, lookup) if custom else {}
         if extra.get("_next_status"):

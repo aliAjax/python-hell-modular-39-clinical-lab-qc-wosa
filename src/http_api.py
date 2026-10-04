@@ -70,7 +70,17 @@ def create_handler(service, rules, static_dir):
                 status = 400
             else:
                 status = 500
-            self._send(status, {"error": str(exc), "type": type(exc).__name__})
+            payload = {"error": str(exc), "type": type(exc).__name__}
+            details = getattr(exc, "details", None)
+            if details:
+                payload["details"] = details
+            self._send(status, payload)
+
+        def _entity_view(self, entity_id):
+            entity = service.get(entity_id)
+            if entity["kind"] == "takeover":
+                return service.takeover_view(entity_id)
+            return entity
 
         def do_GET(self):
             try:
@@ -85,12 +95,12 @@ def create_handler(service, rules, static_dir):
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
-                    return self._send(200, service.get(parts[2]))
+                    return self._send(200, self._entity_view(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
                     if parts[1] == "entities":
                         raise NotFoundError("not found")
                     if len(parts) == 3:
-                        return self._send(200, service.get(parts[2]))
+                        return self._send(200, self._entity_view(parts[2]))
                     query = parse_qs(parsed.query)
                     status = query.get("status", [None])[0]
                     return self._send(200, {"items": service.list(parts[1], status=status)})
@@ -116,6 +126,7 @@ def create_handler(service, rules, static_dir):
                             action,
                             body.pop("data", body),
                             body.pop("expected_version", None),
+                            self.headers.get("Idempotency-Key"),
                         ),
                     )
                 if len(parts) == 4 and parts[0] == "api" and parts[3] == "actions":
@@ -131,12 +142,20 @@ def create_handler(service, rules, static_dir):
                             action,
                             body.pop("data", body),
                             body.pop("expected_version", None),
+                            self.headers.get("Idempotency-Key"),
                         ),
                     )
                 if len(parts) == 5 and parts[0] == "api" and parts[4] == "actions":
                     return self._send(
                         200,
-                        service.transition(actor, parts[2], parts[3], self._body(), None),
+                        service.transition(
+                            actor,
+                            parts[2],
+                            parts[3],
+                            self._body(),
+                            None,
+                            self.headers.get("Idempotency-Key"),
+                        ),
                     )
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
