@@ -3,6 +3,7 @@ import signal
 from pathlib import Path
 
 from src.http_api import create_server
+from src.migrate import run_migrate
 from src.repository import SQLiteRepository
 from src.rules import RuleEngine
 from src.service import DomainService
@@ -16,6 +17,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     repository = SQLiteRepository(args.db)
+    run_migrate(repository)
     rules = RuleEngine()
     service = DomainService(repository, rules)
     server = create_server(

@@ -140,6 +140,77 @@ class SQLiteRepository:
             connection.close()
         return self.get_entity(entity_id)
 
+    def confirm_handover(self, handover_id, expected_version, status, data, lot_updates, batch_updates):
+        """Atomically confirm a handover and apply its lot/batch effects.
+
+        All writes run in a single ``BEGIN IMMEDIATE`` transaction guarded by
+        the handover's optimistic version, so two concurrent supervisors can
+        never both confirm and a write failure never leaves partial effects.
+        ``lot_updates`` is a list of ``(lot_id, status, data)`` tuples and
+        ``batch_updates`` a list of ``(batch_id, data)`` tuples.
+        """
+        now = utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT version FROM entities WHERE id = ?", (handover_id,)
+            ).fetchone()
+            if not row:
+                raise NotFoundError("entity not found: " + handover_id)
+            current = int(row["version"])
+            if expected_version is not None and current != int(expected_version):
+                raise ConflictError(
+                    "version conflict: expected %s, found %s" % (expected_version, current)
+                )
+            connection.execute(
+                "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                "WHERE id = ? AND version = ?",
+                (status, payload, now, handover_id, current),
+            )
+            for lot_id, lot_status, lot_data in lot_updates:
+                lot_payload = json.dumps(lot_data, ensure_ascii=False, sort_keys=True)
+                connection.execute(
+                    "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                    "WHERE id = ?",
+                    (lot_status, lot_payload, now, lot_id),
+                )
+            for batch_id, batch_data in batch_updates:
+                batch_payload = json.dumps(batch_data, ensure_ascii=False, sort_keys=True)
+                connection.execute(
+                    "UPDATE entities SET version = version + 1, data = ?, updated_at = ? WHERE id = ?",
+                    (batch_payload, now, batch_id),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(handover_id)
+
+    def backfill_result_batch_lots(self):
+        """Backfill ``qc_lot_id`` on result batches created before the handover feature.
+
+        Batches without a handover are treated as not taken over; their
+        original lot is derived from the linked QC run and preserved.
+        Idempotent and silent (no audit), so it can run on every startup.
+        """
+        changed = 0
+        runs = {run["id"]: run for run in self.list_entities(kind="qc_run")}
+        for batch in self.list_entities(kind="result_batch"):
+            if batch["data"].get("qc_lot_id"):
+                continue
+            run = runs.get(batch["data"].get("qc_run_id"))
+            lot_id = run["data"].get("qc_lot_id") if run else None
+            if not lot_id:
+                continue
+            batch["data"]["qc_lot_id"] = lot_id
+            self.update_entity(batch["id"], batch["version"], batch["status"], batch["data"])
+            changed += 1
+        return changed
+
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:
             connection.execute(

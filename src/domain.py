@@ -4,7 +4,15 @@ from typing import Any, Dict
 
 
 class DomainError(Exception):
-    """Base class for domain failures."""
+    """Base class for domain failures.
+
+    ``details`` may carry machine-readable context (e.g. the latest version
+    and unfinished instruments) that API clients need in order to retry.
+    """
+
+    def __init__(self, message, details=None):
+        super().__init__(message)
+        self.details = dict(details or {})
 
 
 class ValidationError(DomainError):

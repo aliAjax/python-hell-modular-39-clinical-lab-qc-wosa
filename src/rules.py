@@ -8,6 +8,20 @@ def _find_one(lookup, kind, field, value):
     return rows[0] if rows else None
 
 
+def _active_lot(lookup, assay_id):
+    lots = [lot for lot in (lookup("qc_lot", "assay_id", assay_id) or []) if lot["status"] == "active"]
+    if not lots:
+        return None
+    return sorted(lots, key=lambda lot: lot["updated_at"])[-1]
+
+
+def _confirmed_handover(lookup, assay_id):
+    for handover in lookup("handover", "assay_id", assay_id) or []:
+        if handover["status"] == "confirmed":
+            return handover
+    return None
+
+
 def calibration_is_valid(calibration_due, as_of):
     return str(calibration_due)[:10] >= str(as_of)[:10]
 
@@ -117,11 +131,12 @@ def _validate_result_batch(actor, data, lookup):
         raise ValidationError("assay does not exist")
     if not _find_one(lookup, "instrument", "id", data.get("instrument_id")):
         raise ValidationError("instrument does not exist")
-    if not _find_one(lookup, "qc_run", "id", data.get("qc_run_id")):
+    run = _find_one(lookup, "qc_run", "id", data.get("qc_run_id"))
+    if not run:
         raise ValidationError("qc run does not exist")
     if int(data.get("patient_count", 0)) < 0:
         raise ValidationError("patient_count cannot be negative")
-    return {}
+    return {"qc_lot_id": run["data"].get("qc_lot_id")}
 
 
 def _validate_evaluate(actor, entity, data, lookup):
@@ -165,6 +180,9 @@ def _validate_release(actor, entity, data, lookup):
             active_holds.append(batch)
     if active_holds:
         raise ConflictError("an intercepted result batch must be resolved first")
+    handover = _confirmed_handover(lookup, entity["data"].get("assay_id"))
+    if handover and entity["data"].get("qc_lot_id") != handover["data"].get("new_lot_id"):
+        raise ConflictError("after takeover the batch must be released under the new lot")
     return {"released_by": actor.user_id}
 
 
@@ -194,6 +212,105 @@ def _validate_correct(actor, entity, data, lookup):
     return {"correction_history": history}
 
 
+def _validate_handover_create(actor, data, lookup):
+    assay = _find_one(lookup, "assay", "id", data.get("assay_id"))
+    if not assay:
+        raise ValidationError("assay does not exist")
+    new_lot = _find_one(lookup, "qc_lot", "id", data.get("new_lot_id"))
+    if not new_lot or new_lot["data"].get("assay_id") != assay["id"]:
+        raise ValidationError("new lot does not exist for assay")
+    if new_lot["status"] != "registered":
+        raise ConflictError("new lot must be registered and not yet active")
+    old_lot = _active_lot(lookup, assay["id"])
+    if not old_lot:
+        raise ConflictError("no active lot to replace; activate the current lot first")
+    if old_lot["id"] == new_lot["id"]:
+        raise ValidationError("new lot must differ from the active lot")
+    instrument_ids = data.get("instrument_ids")
+    if not isinstance(instrument_ids, list) or not instrument_ids:
+        raise ValidationError("instrument_ids must be a non-empty list")
+    if len(set(instrument_ids)) != len(instrument_ids):
+        raise ValidationError("instrument_ids must not contain duplicates")
+    trials = []
+    for instrument_id in instrument_ids:
+        instrument = _find_one(lookup, "instrument", "id", instrument_id)
+        if not instrument:
+            raise ValidationError("instrument does not exist: " + str(instrument_id))
+        trials.append(
+            {
+                "instrument_id": instrument_id,
+                "trial_run_id": None,
+                "status": "pending",
+                "recorded_at": None,
+            }
+        )
+    for handover in lookup("handover", "assay_id", assay["id"]) or []:
+        if handover["status"] == "open":
+            raise ConflictError("an open handover already exists for this assay")
+    data.pop("instrument_ids", None)
+    return {
+        "old_lot_id": old_lot["id"],
+        "trials": trials,
+        "confirmed_at": None,
+        "confirmed_by": None,
+    }
+
+
+def _validate_record_trial(actor, entity, data, lookup):
+    if entity["status"] != "open":
+        raise InvalidTransition("handover is not open")
+    instrument_id = data.get("instrument_id")
+    qc_run_id = data.get("qc_run_id")
+    if not instrument_id or not qc_run_id:
+        raise ValidationError("instrument_id and qc_run_id are required")
+    run = _find_one(lookup, "qc_run", "id", qc_run_id)
+    if not run:
+        raise ValidationError("qc run does not exist")
+    if run["data"].get("assay_id") != entity["data"].get("assay_id"):
+        raise ValidationError("qc run belongs to another assay")
+    if run["data"].get("qc_lot_id") != entity["data"].get("new_lot_id"):
+        raise ValidationError("trial run must use the new lot")
+    if run["data"].get("instrument_id") != instrument_id:
+        raise ValidationError("qc run was performed on another instrument")
+    if run["status"] not in ("accepted", "rejected"):
+        raise ConflictError("trial run must be evaluated as accepted or rejected")
+    trials = [dict(trial) for trial in entity["data"].get("trials", [])]
+    slot = None
+    for trial in trials:
+        if trial["instrument_id"] == instrument_id:
+            slot = trial
+            break
+    if slot is None:
+        raise ValidationError("instrument is not part of this handover")
+    trial_status = "passed" if run["status"] == "accepted" else "failed"
+    changed = slot.get("trial_run_id") != qc_run_id or slot.get("status") != trial_status
+    if changed:
+        slot["trial_run_id"] = qc_run_id
+        slot["status"] = trial_status
+        slot["recorded_at"] = run["updated_at"]
+    return {"trials": trials, "_noop": not changed}
+
+
+def _validate_handover_confirm(actor, entity, data, lookup):
+    if entity["status"] != "open":
+        raise InvalidTransition("handover is not open")
+    unfinished = [
+        trial
+        for trial in entity["data"].get("trials", [])
+        if trial.get("status") != "passed"
+    ]
+    if unfinished:
+        raise ConflictError(
+            "cannot confirm: %s instrument(s) have not passed trial" % len(unfinished),
+            details={
+                "handover_id": entity["id"],
+                "current_version": entity["version"],
+                "unfinished": unfinished,
+            },
+        )
+    return {}
+
+
 class RuleEngine:
     ALIASES = {
         "assays": "assay",
@@ -201,6 +318,7 @@ class RuleEngine:
         "instruments": "instrument",
         "qc_runs": "qc_run",
         "result_batches": "result_batch",
+        "handovers": "handover",
     }
     INITIAL_STATUS = {
         "assay": "active",
@@ -208,6 +326,7 @@ class RuleEngine:
         "instrument": "ready",
         "qc_run": "pending",
         "result_batch": "waiting",
+        "handover": "open",
     }
     TRANSITIONS = {
         "assay": {
@@ -241,6 +360,11 @@ class RuleEngine:
             "resolve": (("investigating",), "resolved"),
             "correct": (("waiting", "intercepted", "investigating", "released", "resolved"), "waiting"),
         },
+        "handover": {
+            "record_trial": (("open",), "open"),
+            "confirm": (("open",), "confirmed"),
+            "abort": (("open",), "aborted"),
+        },
     }
     CREATE_REQUIRED = {
         "assay": ("name", "unit", "allowed_low", "allowed_high"),
@@ -248,6 +372,7 @@ class RuleEngine:
         "instrument": ("name", "serial", "calibration_due"),
         "qc_run": ("assay_id", "qc_lot_id", "instrument_id", "value", "run_at"),
         "result_batch": ("assay_id", "instrument_id", "qc_run_id", "run_at", "patient_count"),
+        "handover": ("assay_id", "new_lot_id", "instrument_ids"),
     }
     ACTION_REQUIRED = {
         ("assay", "suspend"): ("reason",),
@@ -268,6 +393,9 @@ class RuleEngine:
         ("result_batch", "investigate"): ("reason",),
         ("result_batch", "resolve"): ("resolution",),
         ("result_batch", "correct"): ("reason",),
+        ("handover", "record_trial"): ("instrument_id", "qc_run_id"),
+        ("handover", "confirm"): (),
+        ("handover", "abort"): ("reason",),
     }
     CREATE_ROLES = {
         "assay": ("supervisor", "admin"),
@@ -275,6 +403,7 @@ class RuleEngine:
         "instrument": ("supervisor", "admin"),
         "qc_run": ("operator", "supervisor", "admin"),
         "result_batch": ("operator", "supervisor", "admin"),
+        "handover": ("supervisor", "admin"),
     }
     ROLE_ACTIONS = {
         "suspend": ("supervisor", "admin"),
@@ -292,6 +421,9 @@ class RuleEngine:
         "correct": ("supervisor", "admin"),
         "release": ("supervisor", "admin"),
         "intercept": ("operator", "supervisor", "admin"),
+        ("handover", "record_trial"): ("operator", "supervisor", "admin"),
+        ("handover", "confirm"): ("supervisor", "admin"),
+        ("handover", "abort"): ("supervisor", "admin"),
     }
     CUSTOM_CREATE = {
         "assay": _validate_assay,
@@ -299,6 +431,7 @@ class RuleEngine:
         "instrument": _validate_instrument,
         "qc_run": _validate_qc_run,
         "result_batch": _validate_result_batch,
+        "handover": _validate_handover_create,
     }
     CUSTOM_TRANSITIONS = {
         ("qc_run", "evaluate"): _validate_evaluate,
@@ -307,6 +440,8 @@ class RuleEngine:
         ("qc_lot", "switch_in"): _validate_switch_lot,
         ("qc_run", "correct"): _validate_correct,
         ("result_batch", "correct"): _validate_correct,
+        ("handover", "record_trial"): _validate_record_trial,
+        ("handover", "confirm"): _validate_handover_confirm,
     }
 
     def normalize_kind(self, kind):
